@@ -1,0 +1,12 @@
+flask==2.3.3
+flask-sock==0.6.0
+twilio==8.10.0
+requests==2.31.0
+python-dotenv==1.0.0
+websockets==11.0.3
+azure-cognitiveservices-speech==1.32.1
+quart
+hypercorn
+httpx
+werkzeug==2.3.7
+uvicorn
