@@ -7,6 +7,11 @@ from twilio.twiml.messaging_response import MessagingResponse  # NEW: for WhatsA
 import azure.cognitiveservices.speech as speechsdk
 import httpx
 
+# --- EMAIL ADD (imports) ---
+import smtplib
+from email.message import EmailMessage
+# ---------------------------
+
 # ---- NEW: Excel (OpenPyXL) support ----
 try:
     from openpyxl import Workbook, load_workbook
@@ -231,7 +236,7 @@ def _norm_strasse_case(s: str) -> str:
 # ---- NEW: Excel append helper ----
 def _append_record_excel(name: str, phone: str, path: str = "Record.xlsx"):
     if not OPENPYXL_AVAILABLE:
-        logger.error("[Excel] openpyxl not available; cannot write Record.xlsx")
+        logger.error("[Excel] openpyxl not available; cannot write Record.xlsx]")
         return
     try:
         if os.path.exists(path):
@@ -298,7 +303,7 @@ def extract_address(user_text: str, call_state: dict):
             tail = work[m.end():]
             h = HOUSE_AFTER_RE.match(tail)
             if h:
-                addr["house"] = h.group("house")
+                addr["house"] = h.group(["house"])
 
     # If street known but house missing, try after street
     if addr.get("street") and (not addr.get("house") or override):
@@ -468,19 +473,117 @@ def format_known_info(call_state: dict) -> str:
     b = call_state.get("booking", {})
     addr = _pretty_address(c.get("address") or {})
     lines = [
-        "Hier ist die Zusammenfassung der gespeicherten Daten:",
-        f"• Name: {c.get('name') or '(unknown)'}",
-        f"• Telefon: {c.get('phone') or '(unknown)'}",
-        f"• E-Mail: {c.get('email') or '(unknown)'}",
-        f"• Adresse: {addr}",
+        "Appointment Summary / Termin-Zusammenfassung",
         "",
-        "Termin/Service:",
-        f"• Fahrzeug/Service: {b.get('vehicle') or '(unknown)'}",
-        f"• Problem/Beschreibung: {b.get('problem') or '(unknown)'}",
-        f"• Slot: {(b.get('slot_start') or '(unknown)')} bis {(b.get('slot_end') or '(unknown)')}",
+        "Contact / Kontakt:",
+        f"• Name: {c.get('name') or '(unknown)'}",
+        f"• Phone: {c.get('phone') or '(unknown)'}",
+        f"• Email: {c.get('email') or '(unknown)'}",
+        "",
+        "Booking / Termin:",
+        f"• Vehicle/Service: {b.get('vehicle') or '(unknown)'}",
+        f"• Problem/Description: {b.get('problem') or '(unknown)'}",
+        f"• Slot: {(b.get('slot_start') or '(unknown)')} – {(b.get('slot_end') or '(unknown)')}",
     ]
     return "\n".join(lines)
 # ------------------------------------------------------------
+
+# --- EMAIL ADD: confirmation + summary detectors ---
+_CONFIRM_CUE = re.compile(
+    r"\b(appointment\s+confirmed|confirmed\s+appointment|your\s+appointment\s+is\s+confirmed|"
+    r"termin\s+bestätigt|termin\s+ist\s+bestätigt|ich\s+habe\s+den\s+termin\s+eingetragen|"
+    r"termin\s+gebucht|termin\s+vereinbart)\b",
+    re.IGNORECASE
+)
+_SUMMARY_CUE = re.compile(
+    r"(?:^|\n)\s*zusammenfassung\s*:|(?:^|\n)\s*appointment\s+summary\s*:|"
+    r"(?:^|\n)\s*termin[-\s]*zusammenfassung\s*:",
+    re.IGNORECASE
+)
+_SUMMARY_BULLETS = re.compile(
+    r"(?:^|\n)\s*-\s*(fahrzeug|vehicle)\s*:\s*.+"
+    r".*?(?:^|\n)\s*-\s*(problem|beschreibung|issue|description)\s*:\s*.+"
+    r".*?(?:^|\n)\s*-\s*(termin|slot|time)\s*:\s*.+"
+    r".*?(?:^|\n)\s*-\s*(name)\s*:\s*.+"
+    r".*?(?:^|\n)\s*-\s*(telefon|phone)\s*:\s*.+"
+    r".*?(?:^|\n)\s*-\s*(e-?mail)\s*:\s*.+",
+    re.IGNORECASE | re.DOTALL
+)
+# NEW: exact “Zusammenfassung” block extractor (verbatim)
+_SUMMARY_BLOCK = re.compile(
+    r'((?:^|\n)\s*(?:Zusammenfassung|Termin[-\s]*Zusammenfassung|Appointment\s+Summary)\s*:\s*\n(?:\s*(?:[-•]\s.*)\n?)+)',
+    re.IGNORECASE
+)
+# ---------------------------------------------------
+
+def _maybe_send_confirmation_email(assistant_text: str, call_state: dict):
+    try:
+        txt = assistant_text or ""
+        # Trigger when explicit confirmation OR a recognizable summary header/bullets appear
+        if not (_CONFIRM_CUE.search(txt) or _SUMMARY_CUE.search(txt) or _SUMMARY_BULLETS.search(txt)):
+            return
+
+        meta = call_state.setdefault("meta", {})
+        if meta.get("email_sent"):
+            return  # remove if you want multiple sends per session
+
+        email_to = (call_state.get("contact") or {}).get("email")
+        if not email_to:
+            logger.info("[EMAIL] No recipient email captured; skipping send.")
+            return
+
+        # Extract the exact Zusammenfassung block (verbatim). If missing, skip sending.
+        m = _SUMMARY_BLOCK.search(txt)
+        if not m:
+            logger.info("[EMAIL] No explicit 'Zusammenfassung' block found in assistant text; skipping email.")
+            return
+
+        subject = f"{state._company_name()} — Terminbestätigung / Appointment Confirmation"
+        body = m.group(1).strip()  # send the exact block as-is
+
+        _send_email_appointment_summary(email_to, subject, body)
+        meta["email_sent"] = True
+        logger.info(f"[EMAIL] Confirmation sent to {email_to}")
+    except Exception as e:
+        logger.error(f"[EMAIL] Failed to maybe-send confirmation: {e}")
+
+def _send_email_appointment_summary(to_email: str, subject: str, body: str):
+    server = os.getenv("SMTP_SERVER", "").strip()
+    port_str = os.getenv("SMTP_PORT", "587").strip()
+    email_from = os.getenv("EMAIL_FROM", "").strip()
+    password = os.getenv("EMAIL_PASSWORD", "").strip()
+
+    if not (server and port_str and email_from and password and to_email):
+        logger.error("[EMAIL] Missing SMTP env vars or recipient.")
+        return
+
+    try:
+        port = int(port_str)
+    except Exception:
+        port = 587
+
+    msg = EmailMessage()
+    msg["From"] = email_from
+    msg["To"] = to_email
+    msg["Subject"] = subject
+    msg.set_content(body)
+
+    try:
+        if port == 465:
+            with smtplib.SMTP_SSL(server, port, timeout=15) as s:
+                s.login(email_from, password)
+                s.send_message(msg)
+        else:
+            with smtplib.SMTP(server, port, timeout=15) as s:
+                s.ehlo()
+                try:
+                    s.starttls()
+                except Exception:
+                    pass
+                s.login(email_from, password)
+                s.send_message(msg)
+    except Exception as e:
+        logger.error(f"[EMAIL] SMTP send failed: {e}")
 
 def build_system_prompt_with_memory(call_state: dict) -> str:
     """
@@ -518,19 +621,13 @@ def build_system_prompt_with_memory(call_state: dict) -> str:
     slot_start = booking.get("slot_start") or "(unknown)"
     slot_end   = booking.get("slot_end")   or "(unknown)"
 
-    closing_hint = (
-        "• Da sowohl Name als auch Telefonnummer bekannt sind, biete nach Klärung des Anliegens eine kurze Abschluss-Rückfrage an.\n"
-        if (name and phone) else ""
-    )
-
-    # ---- MINIMAL ADD: explicit “recap on request” instruction for LLM ----
+    # explicit recap rule
     recap_rule = (
         "- Wenn der Nutzer um eine **Wiederholung/Zusammenfassung** bittet "
         "(z. B. „repeat“, „recap“, „summary“, „Termin details“), "
         "dann liste **alle bekannten** Kontaktdaten und Terminangaben als kurze Aufzählung auf. "
         "Das Wiederholen der eigenen Daten des Nutzers ist **erlaubt**.\n"
     )
-    # ----------------------------------------------------------------------
 
     memory_lines = [
         "Call/Chat meta:",
@@ -1074,6 +1171,9 @@ async def media():
         if full and turn_id == current_turn["id"]:
             history.append({"role": "assistant", "content": full})
             logger.info(f"[Bot] {full}")
+            # --- EMAIL ADD: trigger after confirmation/summary is spoken ---
+            _maybe_send_confirmation_email(full, call_state)
+            # --------------------------------------------------------------
 
     async def consume_finals():
         nonlocal llm_task, tts_cancel, interaction_started, allow_hangup
@@ -1158,7 +1258,7 @@ async def media():
                 else:
                     speech_streak_frames = 0
 
-                if tts_busy and speech_streak_frames >= REQ_STREAK_FRAMES:
+                if tts_busy and speech_streak_frames >= 5:
                     tts_cancel = True
                     try:
                         await websocket.send(json.dumps({"event": "clear", "streamSid": stream_sid}))
@@ -1270,7 +1370,7 @@ async def incoming_whatsapp():
     - identify sender
     - load/create their session
     - update memory (contact/address)
-    - (NEW) if user asks for a recap, return a deterministic summary
+    - if user asks for a recap, return a deterministic summary
     - else LLM answer
     - respond with Twilio MessagingResponse
     - persist session to disk
@@ -1327,17 +1427,18 @@ async def incoming_whatsapp():
     sess["history"].append({"role": "user", "content": body_text})
     logger.info(f"[WA User {from_number}] {body_text} | MEM: {sess['call_state']['contact']}")
 
-    # ---- MINIMAL ADD: deterministic recap when requested ----
+    # deterministic recap when requested
     if _wants_recap(body_text):
         assistant_text = format_known_info(sess["call_state"])
     else:
-        # run LLM
         assistant_text = await llm_complete_once(sess["history"], body_text, sess["call_state"])
-    # ---------------------------------------------------------
 
     # append assistant turn
     sess["history"].append({"role": "assistant", "content": assistant_text})
     logger.info(f"[WA Bot -> {from_number}] {assistant_text}")
+
+    # EMAIL trigger when confirmation or summary text appears
+    _maybe_send_confirmation_email(assistant_text, sess["call_state"])
 
     # persist session to disk so we don't forget name/address/booking next message
     _persist_sessions()
